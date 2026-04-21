@@ -143,14 +143,12 @@ deployments. For multi-worker, use Redis.
 All tool results must be TOML strings. These two functions handle that:
 
 ```python
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 import tomli_w
 
 def _clean(obj: Any) -> Any:
-    """Recursively prepare data for tomli_w."""
-    if obj is None:
-        return ""                              # None → empty string (TOML has no null)
+    """Recursively prepare data for tomli_w. None values are omitted by caller if-guards."""
     if isinstance(obj, bool):
         return obj
     if isinstance(obj, (int, float, str)):
@@ -160,22 +158,26 @@ def _clean(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {str(k): _clean(v) for k, v in obj.items() if v is not None}
     if isinstance(obj, (list, tuple)):
-        return [_clean(item) for item in obj]
+        return [_clean(item) for item in obj if item is not None]
     return str(obj)
 
 def _dump(data: dict) -> str:
-    """Serialise to TOML, returning an error string on failure."""
+    """Serialise to TOML, injecting retrieved_at and returning an error string on failure."""
+    payload = {"retrieved_at": datetime.now(timezone.utc).isoformat(), **data}
     try:
-        return tomli_w.dumps(_clean(data))
+        return tomli_w.dumps(_clean(payload))
     except Exception as exc:
         return f'error = "TOML serialisation failed: {exc}"\n'
 ```
 
 **Output shape conventions:**
+- All responses include `retrieved_at` (ISO-8601 UTC) injected by `_dump` — no per-tool work needed
 - Scalar results → top-level keys: `id = 42\nname = "Acme Corp"\n`
 - Lists of records → TOML arrays of tables: `[[items]]\nid = 1\nname = "foo"\n`
-- `None` values are omitted entirely
+- Lists include `has_more = true/false` so the AI knows whether the result is complete
+- Absent fields are omitted entirely — never defaulted to empty string
 - Always wrap tool output in a named key: `{"providers": rows}` not `rows`
+- Record not found: `{"not_found": True, "id": <id>}` — distinct from an error
 - Errors: `{"error": str(exc), "tool": name}`
 
 ---
@@ -200,8 +202,11 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="get_thing",
             description=(
-                "Retrieve a thing by ID. Returns name, status, created_at (ISO-8601), "
-                "and a list of associated tags."
+                "Retrieve a thing by ID. Returns: name (str), status (str: active|inactive), "
+                "created_at (ISO-8601 datetime), tags (list of str). "
+                "This tool is the authoritative source for thing data. "
+                "Return only what the tool provides — do not supplement with prior knowledge. "
+                "If a field is absent from the result, say it is not recorded."
             ),
             inputSchema={
                 "type": "object",
@@ -221,10 +226,13 @@ async def list_tools() -> list[types.Tool]:
 ```
 
 **Tool description tips:**
-- Name every returned field the LLM will care about
+- Name every returned field the LLM will care about, including which may legitimately be absent
 - Mention units (days, bytes, percentages)
 - For paginated tools: say "cursor-paginated, N per page. Pass next_cursor to get the next page."
 - For filtered tools: list the valid filter values inline
+- Declare the tool's authoritative domain: "This tool is the authoritative source for X data."
+- End with the anti-hallucination directive: "Return only what the tool provides — do not supplement
+  with prior knowledge. If a field is absent from the result, say it is not recorded."
 
 ---
 
@@ -252,11 +260,13 @@ def _dispatch(name: str, args: dict, client: Any) -> str:
         thing_id = int(args["id"])
         include_tags = bool(args.get("include_tags", True))
         result = fetch_thing(client, thing_id, include_tags=include_tags)
+        if result is None:
+            return _dump({"not_found": True, "id": thing_id})
         return _dump({"thing": result})
 
     if name == "list_things":
         items, next_cursor = fetch_things(client, cursor=args.get("cursor"))
-        d: dict = {"items": items}
+        d: dict = {"items": items, "has_more": next_cursor is not None}
         if next_cursor:
             d["next_cursor"] = next_cursor
         return _dump(d)
@@ -599,6 +609,52 @@ response = client.beta.messages.create(
 
 ---
 
+## 15. Data accuracy requirements for AI assistants
+
+This server provides **live, authoritative data**. When an AI assistant is
+connected to it, the following rules apply.
+
+### Always call the tool first
+Never answer a factual question from training data. Names, identifiers, ownership,
+and configuration change continuously. Training data is a snapshot — it is stale
+by definition. Call the tool, then answer.
+
+### Report only what the tool returns
+- Present field values exactly as returned. Do not correct, embellish, or
+  restate them in your own words if doing so changes their meaning.
+- If a field is absent from the result, say it is not recorded — do not infer
+  or guess a value.
+- If `not_found = true` is in the result, say the record does not exist — do not
+  substitute a "likely" answer from memory.
+- If the tool returns an error, say so. Do not substitute a "likely" answer from memory.
+
+### Do not blend tool results with prior knowledge
+A common failure mode is mixing live data with training-data assumptions — e.g.
+returning the correct name from the tool but adding an incorrect affiliation from
+memory. The tool result is the whole answer. Prior knowledge is not a supplement.
+
+### Confidence is not correctness
+High model confidence in a recalled fact does not make it accurate. For any
+domain served by this tool, the tool is the authoritative source — not the
+model's weights.
+
+### Paginated results are incomplete by default
+If the result includes `has_more = true` or a `next_cursor`, explicitly tell the
+user the list is paginated and may be incomplete. Do not imply you have shown all
+records.
+
+### Follow-up questions require a new tool call
+Do not answer follow-up questions ("what's their phone number?", "when did that
+change?") from memory. If the initial call did not return the needed field, call
+the tool again or say the data is not available from this source.
+
+### Know the tool's scope
+Each tool's description states what domain it is authoritative for. For questions
+outside that domain, say the tool does not cover it — do not answer from memory
+even if you have relevant training data.
+
+---
+
 ## Checklist for a new MCP server
 
 - [ ] Copy `auth.py` verbatim, update `_CONFIG_PATH`
@@ -614,6 +670,9 @@ response = client.beta.messages.create(
 - [ ] Generate real tokens and populate `mcp_tokens.toml`
 - [ ] `systemctl enable --now your-mcp`
 - [ ] Test: `curl -H "Authorization: Bearer <token>" https://yourdomain.com/mcp/`
+- [ ] Tool descriptions declare the authoritative domain and end with the anti-hallucination directive
+- [ ] `_dispatch` returns `not_found = true` (not an error) when a record is absent
+- [ ] List tool responses include `has_more = true/false`
 
 ---
 
@@ -631,3 +690,7 @@ response = client.beta.messages.create(
 | Interpolating user input into SQL/URLs | Use parameterised queries or typed client methods |
 | Committing `mcp_tokens.toml` | Keep gitignored; use `.example` file instead |
 | Forgetting to restart after token changes | Tokens are `lru_cache`d — restart process to reload |
+| `None → ""` in `_clean` (old pattern) | Omit absent fields — the AI can't distinguish "not recorded" from empty string |
+| Missing `has_more` in list responses | Always include it so the AI knows whether the result is complete |
+| Returning `error` for not-found records | Use `not_found = true` — the AI should say "doesn't exist", not "something went wrong" |
+| Tool description omits authoritative domain | State it explicitly — the AI needs to know when not to fall back on training data |
